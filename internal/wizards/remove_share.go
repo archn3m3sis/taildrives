@@ -3,6 +3,7 @@ package wizards
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
@@ -33,11 +34,13 @@ type removeShareWizard struct {
 	devices     []string
 	deviceIdx   int
 
-	loading    bool
-	shares     []string
-	shareIdx   int
-	marked     map[int]bool
-	loadErr    error
+	loading     bool
+	loadID      int       // increments per load attempt; used to ignore stale results
+	loadStartAt time.Time // when the current load started (for elapsed-time UI)
+	shares      []string
+	shareIdx    int
+	marked      map[int]bool
+	loadErr     error
 
 	results    []removeResult
 	resultIdx  int
@@ -148,18 +151,42 @@ func (r *removeShareWizard) updateDevicePick(msg tea.Msg) (Overlay, tea.Cmd, boo
 type sharesLoadedMsg struct {
 	shares []string
 	err    error
+	loadID int // discriminates which load attempt this msg belongs to
+}
+
+// loadTimeoutMsg fires N seconds after a load starts. If we still haven't
+// gotten a sharesLoadedMsg for the same loadID by then, we treat the
+// device as busy/unreachable and surface a clean error instead of letting
+// the wizard sit in the "loading…" state indefinitely. Operator hit this
+// on 2026-05-18 after a remove + immediate re-enter on the same device.
+type loadTimeoutMsg struct {
+	loadID int
 }
 
 func (r *removeShareWizard) loadShares() tea.Cmd {
 	dev := r.devices[r.deviceIdx]
-	return func() tea.Msg {
-		s, err := actions.SharesOn(dev)
-		return sharesLoadedMsg{shares: s, err: err}
-	}
+	r.loadID++
+	id := r.loadID
+	r.loading = true
+	r.loadStartAt = time.Now()
+	return tea.Batch(
+		func() tea.Msg {
+			s, err := actions.SharesOn(dev)
+			return sharesLoadedMsg{shares: s, err: err, loadID: id}
+		},
+		tea.Tick(10*time.Second, func(time.Time) tea.Msg {
+			return loadTimeoutMsg{loadID: id}
+		}),
+	)
 }
 
 func (r *removeShareWizard) updateLoadShares(msg tea.Msg) (Overlay, tea.Cmd, bool) {
-	if m, ok := msg.(sharesLoadedMsg); ok {
+	switch m := msg.(type) {
+	case sharesLoadedMsg:
+		// Ignore stale results from a previous load attempt.
+		if m.loadID != r.loadID {
+			return r, nil, false
+		}
 		r.shares = m.shares
 		r.loadErr = m.err
 		r.loading = false
@@ -171,6 +198,26 @@ func (r *removeShareWizard) updateLoadShares(msg tea.Msg) (Overlay, tea.Cmd, boo
 		}
 		r.step = rmPickShares
 		r.shareIdx = 0
+	case loadTimeoutMsg:
+		// Only fire if we're still loading the same attempt — a real
+		// result that arrived first will have flipped r.loading=false.
+		if m.loadID != r.loadID || !r.loading {
+			return r, nil, false
+		}
+		r.loading = false
+		r.step = rmResult
+		r.results = []removeResult{{Err: fmt.Errorf(
+			"%s did not respond within 10s — the tailscale daemon may be busy processing a prior operation. Retry from the menu.",
+			r.devices[r.deviceIdx])}}
+		return r, nil, false
+	case tea.KeyMsg:
+		// While loading, Esc cancels back to the device picker so the
+		// operator isn't trapped.
+		if m.String() == "esc" {
+			r.step = rmPickDevice
+			r.loading = false
+			return r, nil, false
+		}
 	}
 	return r, nil, false
 }
@@ -308,7 +355,15 @@ func (r *removeShareWizard) View(w, h int) string {
 	case rmPickDevice:
 		content = r.renderDevicePick()
 	case rmLoadShares:
-		content = "\n  loading shares from " + theme.AccentHiS.Render(r.devices[r.deviceIdx]) + "…"
+		elapsed := time.Since(r.loadStartAt).Truncate(time.Second)
+		hint := ""
+		if elapsed >= 4*time.Second {
+			hint = "\n  " + theme.Warn.Render(fmt.Sprintf(
+				"taking longer than usual — tailscale daemon may be processing a prior operation (%s elapsed)",
+				elapsed))
+		}
+		content = "\n  loading shares from " + theme.AccentHiS.Render(r.devices[r.deviceIdx]) + "…" +
+			hint + "\n\n  " + theme.ItemDim.Render("Esc to cancel and pick a different device")
 	case rmPickShares:
 		content = r.renderSharePick()
 	case rmConfirm:

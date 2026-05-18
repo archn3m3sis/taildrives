@@ -38,7 +38,7 @@ func NewKeymap() Keymap {
 		BulkSend:    key.NewBinding(key.WithKeys("b"), key.WithHelp("b", "bulk-send")),
 		Mount:       key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "mount info")),
 		Refresh:     key.NewBinding(key.WithKeys("r", "f5"), key.WithHelp("r", "refresh")),
-		Search:      key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "search")),
+		Search:      key.NewBinding(key.WithKeys("/", "s"), key.WithHelp("s or /", "fuzzy search")),
 		Filter:      key.NewBinding(key.WithKeys("t"), key.WithHelp("t", "category filter")),
 		Help:        key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "help")),
 		Quit:        key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quit")),

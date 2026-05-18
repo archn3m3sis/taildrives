@@ -58,6 +58,9 @@ type fileBrowser struct {
 	// Fuzzy search state — `s` opens; Esc closes. Index is a list of
 	// paths walked from the device's "home root" with a depth cap; results
 	// is the substring-filtered subset shown as the user types.
+	// searchDirsOnly toggles via Ctrl+D — when true, files drop out of
+	// the result set so the operator can drill into directory structure
+	// without folder candidates being drowned out by files.
 	searchActive    bool
 	searchInput     textinput.Model
 	searchIndex     []indexedPath
@@ -66,6 +69,22 @@ type fileBrowser struct {
 	searchResults   []indexedPath
 	searchIdx       int
 	searchScroll    int
+	searchDirsOnly  bool
+
+	// sharedPaths is a set of absolute paths that are CURRENTLY registered
+	// as Taildrive shares on the active device. Used to render a SHARED
+	// badge next to entries that already publish via Taildrive — avoids
+	// the operator accidentally re-sharing the same dir under a new name.
+	// Populated once on newFileBrowser; local fs only for v0.13.x (remote
+	// would need an SSH+parse round-trip per browse).
+	sharedPaths map[string]bool
+
+	// dirStats caches recursive-size + content-by-type breakdowns for
+	// directories the operator has highlighted. Walking a directory is
+	// I/O-bound and can take seconds for large trees, so we cache by
+	// absolute path and only fire a walk once per session per dir.
+	// Local fs only — remote dirs show nothing extra here.
+	dirStats map[string]*dirStat
 
 	// Returned when the user hits `s` — the full absolute path selected.
 	Selected string
@@ -73,6 +92,20 @@ type fileBrowser struct {
 	// done flips when the user picks or cancels.
 	done     bool
 	canceled bool
+}
+
+// dirStat is the cached recursive walk result for one directory: total
+// bytes, subdir count, and a per-category file count map. Computing is
+// true while a walk is in flight (so we don't double-dispatch the same
+// path). Truncated is true if the walker hit the 50K-entry or 3-second
+// caps before finishing — UI surfaces that note so the operator knows
+// the numbers shown are partial.
+type dirStat struct {
+	Size        int64
+	SubdirCount int
+	ByCategory  map[string]int
+	Computing   bool
+	Truncated   bool
 }
 
 // indexedPath is one entry in the fuzzy search index — the absolute path
@@ -83,6 +116,157 @@ type indexedPath struct {
 	Lower    string
 	Base     string
 	IsDir    bool
+}
+
+// ── Recursive dir stats ────────────────────────────────────────────────
+
+// dirStatsMsg is the async result of a recursive walk over one directory.
+// Sent by computeDirStats Cmd, handled by browser.update which caches by
+// path so re-highlighting the same dir is free.
+type dirStatsMsg struct {
+	path  string
+	stats *dirStat
+}
+
+// categorizeFile maps a filename to a human-readable category label used
+// in the right-pane stats breakdown. Parallel structure to iconFor so the
+// category buckets the operator sees in the detail pane match the icons
+// they see in the listing.
+func categorizeFile(name string) string {
+	name = strings.ToLower(name)
+	ext := ""
+	if i := strings.LastIndex(name, "."); i >= 0 {
+		ext = name[i+1:]
+	}
+	switch ext {
+	case "jpg", "jpeg", "png", "gif", "webp", "heic", "heif",
+		"bmp", "tiff", "tif", "svg", "ico":
+		return "IMAGES"
+	case "mp4", "mkv", "mov", "avi", "webm", "flv", "m4v", "wmv":
+		return "VIDEOS"
+	case "mp3", "flac", "wav", "m4a", "ogg", "oga", "opus", "aac", "aiff":
+		return "AUDIO FILES"
+	case "zip", "tar", "gz", "tgz", "bz2", "xz", "7z", "rar", "zst":
+		return "ARCHIVES"
+	case "pdf":
+		return "PDF FILES"
+	case "doc", "docx", "rtf", "odt", "pages":
+		return "DOC FILES"
+	case "md", "markdown":
+		return "MARKDOWN FILES"
+	case "txt", "rst", "log":
+		return "TEXT FILES"
+	case "go", "py", "rs", "c", "cpp", "h", "hpp", "java", "kt", "rb",
+		"swift", "m", "mm", "sh", "bash", "zsh", "nix", "js", "ts",
+		"jsx", "tsx", "html", "css", "scss", "lua", "php", "pl", "sql":
+		return "CODE FILES"
+	case "yaml", "yml", "toml", "ini", "conf", "cfg", "json", "env", "plist":
+		return "CONFIG FILES"
+	case "key", "pem", "crt", "cer", "p12", "pfx", "gpg", "asc":
+		return "KEYS / CERTS"
+	case "db", "sqlite", "sqlite3", "dump":
+		return "DATABASES"
+	case "dmg", "pkg", "app", "deb", "rpm", "msi", "exe":
+		return "INSTALLERS"
+	case "iso", "img", "qcow2", "vmdk", "vdi":
+		return "DISK IMAGES"
+	}
+	return "OTHER FILES"
+}
+
+// computeDirStats walks `root` recursively in a goroutine and returns a
+// dirStatsMsg with the aggregated total size, subdir count, and per-
+// category file counts. Hard caps (50K entries / 3s wall time) keep this
+// from blocking the UI for pathological cases like a $HOME walk — if hit,
+// stats.Truncated is set so the View can label the result as partial.
+func computeDirStats(root string) tea.Cmd {
+	return func() tea.Msg {
+		const maxEntries = 50000
+		const maxTime = 3 * time.Second
+		deadline := time.Now().Add(maxTime)
+		stats := &dirStat{ByCategory: make(map[string]int)}
+		count := 0
+
+		var walk func(dir string)
+		walk = func(dir string) {
+			if count >= maxEntries || time.Now().After(deadline) {
+				stats.Truncated = true
+				return
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				return
+			}
+			for _, e := range entries {
+				if count >= maxEntries || time.Now().After(deadline) {
+					stats.Truncated = true
+					return
+				}
+				count++
+				name := e.Name()
+				if strings.HasPrefix(name, ".") {
+					// Skip hidden files in the count — matches what the
+					// listing UI shows by default. Operator gets a "feels
+					// right" total instead of a number inflated by .git/
+					// or .DS_Store noise.
+					continue
+				}
+				full := dir + "/" + name
+				if dir == "/" {
+					full = "/" + name
+				}
+				info, err := e.Info()
+				if err != nil {
+					continue
+				}
+				isDir := e.IsDir()
+				if !isDir && info.Mode()&os.ModeSymlink != 0 {
+					if t, err := os.Stat(full); err == nil {
+						isDir = t.IsDir()
+					}
+				}
+				if isDir {
+					stats.SubdirCount++
+					walk(full)
+				} else {
+					stats.Size += info.Size()
+					stats.ByCategory[categorizeFile(name)]++
+				}
+			}
+		}
+		walk(root)
+		return dirStatsMsg{path: root, stats: stats}
+	}
+}
+
+// maybeStartDirStats checks whether the currently-highlighted entry is a
+// directory we don't have stats for yet, and if so dispatches a walk Cmd.
+// Called after any navigation key in update(); idempotent via the
+// Computing flag in the cache so rapid scrolling doesn't dispatch dozens
+// of overlapping walks.
+//
+// Local fs only — remote stats would need an SSH find+du round-trip per
+// highlighted dir and would be unusably slow.
+func (f *fileBrowser) maybeStartDirStats(vis []fbEntry) tea.Cmd {
+	if f.device != "" && f.device != local.HostName() {
+		return nil
+	}
+	if f.idx <= 0 || f.idx-1 >= len(vis) {
+		return nil
+	}
+	e := vis[f.idx-1]
+	if !e.IsDir {
+		return nil
+	}
+	full := joinPath(f.device, f.cwd, e.Name)
+	if f.dirStats == nil {
+		f.dirStats = make(map[string]*dirStat)
+	}
+	if _, ok := f.dirStats[full]; ok {
+		return nil // cached or in-flight
+	}
+	f.dirStats[full] = &dirStat{Computing: true, ByCategory: map[string]int{}}
+	return computeDirStats(full)
 }
 
 // ── Fuzzy search ────────────────────────────────────────────────────────
@@ -258,24 +442,33 @@ func pathBase(p string) string {
 
 // applySearch runs the fuzzy-match library against the index using the
 // current input value. Empty input shows everything (capped to a reasonable
-// display count). Results are sorted by match score descending.
+// display count). Results are sorted by match score descending. When
+// searchDirsOnly is set, files are filtered out so only directories
+// remain — useful when the operator is trying to drill into a deep
+// subtree and doesn't want every matching file name as noise.
 func (f *fileBrowser) applySearch() {
 	q := strings.TrimSpace(f.searchInput.Value())
+	// Build the candidate pool first, honoring the dirs-only filter.
+	pool := f.searchIndex
+	if f.searchDirsOnly {
+		pool = pool[:0:0]
+		for _, e := range f.searchIndex {
+			if e.IsDir {
+				pool = append(pool, e)
+			}
+		}
+	}
 	if q == "" {
-		// Show the first N raw entries so the operator has something to
-		// scroll through even before typing.
-		n := len(f.searchIndex)
+		n := len(pool)
 		if n > 200 {
 			n = 200
 		}
-		f.searchResults = f.searchIndex[:n]
+		f.searchResults = pool[:n]
 		f.searchIdx = 0
 		return
 	}
-	// Use fuzzy match on the Path field (sahilm/fuzzy preserves order
-	// already by best match — perfect for this).
-	sources := make([]string, len(f.searchIndex))
-	for i, e := range f.searchIndex {
+	sources := make([]string, len(pool))
+	for i, e := range pool {
 		sources[i] = e.Path
 	}
 	matches := fuzzy.Find(q, sources)
@@ -285,7 +478,7 @@ func (f *fileBrowser) applySearch() {
 		if i >= limit {
 			break
 		}
-		out = append(out, f.searchIndex[m.Index])
+		out = append(out, pool[m.Index])
 	}
 	f.searchResults = out
 	f.searchIdx = 0
@@ -315,7 +508,32 @@ func newFileBrowser(device, startPath string) *fileBrowser {
 			startPath = "D:\\"
 		}
 	}
-	return &fileBrowser{device: device, cwd: startPath, loading: true}
+	fb := &fileBrowser{device: device, cwd: startPath, loading: true}
+	fb.sharedPaths = loadSharedPaths(device)
+	return fb
+}
+
+// loadSharedPaths returns the set of absolute paths that are currently
+// published as Taildrive shares on `device`. Local-only for now — querying
+// remote shares requires an SSH round-trip per browse which would slow
+// the wizard's open. Empty set on remote = no shared markers shown there
+// (a future enhancement can wire in actions.SharesOn-style remote query).
+func loadSharedPaths(device string) map[string]bool {
+	out := map[string]bool{}
+	if device != "" && device != local.HostName() {
+		return out
+	}
+	shares, err := local.ListShares()
+	if err != nil {
+		return out
+	}
+	for _, s := range shares {
+		// Strip trailing slash so the equality check is consistent with
+		// joinPath output for child entries.
+		p := strings.TrimRight(s.Path, "/")
+		out[p] = true
+	}
+	return out
 }
 
 // initial Cmd to load the starting directory
@@ -677,9 +895,12 @@ func rawTagWidth(e fbEntry) int {
 	return len(label) + 2 // 1-cell padding each side
 }
 
-// maxTagWidth is the widest tag we ever render, in cells. Tags up to 4
-// letters ("YAML", "JSON", "HTML", "JAVA", "SCSS", "TSX") + 2 padding.
-const maxTagWidth = 6
+// maxTagWidth is the widest tag we ever render, in cells. Sized for the
+// longest label across the tag set: "SHARED" (6) + 2 padding = 8.
+// Previously 6, which was too tight for IMAGE/VIDEO/SHARED — those would
+// soft-wrap into the next row. nameColW math downstream subtracts this
+// to give the name column the leftover budget.
+const maxTagWidth = 8
 
 // sharingDiscouraged returns true for folders the operator probably should
 // NOT share via Taildrive: system paths, hidden config dirs, OS recovery
@@ -759,6 +980,15 @@ func (f *fileBrowser) update(msg tea.Msg) (*fileBrowser, tea.Cmd) {
 		f.searchIndex = m.paths
 		f.searchIndexErr = m.err
 		f.applySearch()
+		return f, nil
+	case dirStatsMsg:
+		// Recursive walk for the highlighted dir just finished — cache
+		// the result. A late result is fine: it just sits in the cache
+		// and gets shown if the operator highlights the same dir again.
+		if f.dirStats == nil {
+			f.dirStats = make(map[string]*dirStat)
+		}
+		f.dirStats[m.path] = m.stats
 		return f, nil
 	case tea.KeyMsg:
 		// Search mode owns its own key handling.
@@ -845,24 +1075,30 @@ func (f *fileBrowser) update(msg tea.Msg) (*fileBrowser, tea.Cmd) {
 			if f.idx > 0 {
 				f.idx--
 			}
+			return f, f.maybeStartDirStats(vis)
 		case key.Matches(m, key.NewBinding(key.WithKeys("down", "j"))):
 			if f.idx < realCount { // realCount == max idx (synthetic + entries.length)
 				f.idx++
 			}
+			return f, f.maybeStartDirStats(vis)
 		case key.Matches(m, key.NewBinding(key.WithKeys("home", "g"))):
 			f.idx = 0
+			return f, f.maybeStartDirStats(vis)
 		case key.Matches(m, key.NewBinding(key.WithKeys("end", "G"))):
 			f.idx = realCount
+			return f, f.maybeStartDirStats(vis)
 		case key.Matches(m, key.NewBinding(key.WithKeys("pgup", "ctrl+u"))):
 			f.idx -= 10
 			if f.idx < 0 {
 				f.idx = 0
 			}
+			return f, f.maybeStartDirStats(vis)
 		case key.Matches(m, key.NewBinding(key.WithKeys("pgdown", "ctrl+d"))):
 			f.idx += 10
 			if f.idx > realCount {
 				f.idx = realCount
 			}
+			return f, f.maybeStartDirStats(vis)
 		}
 	}
 	return f, nil
@@ -968,12 +1204,19 @@ func (f *fileBrowser) view(w, h int) string {
 	selectRow := func(isSel bool) string {
 		raw := "  " + selectLabel
 		if isSel {
-			// Full pane-width fill — same fix as the entry-row highlight
-			// so the right edge doesn't leak the terminal background.
-			return lipgloss.NewStyle().
-				Background(theme.AccentHi).Foreground(lipgloss.Color("#000000")).
-				Bold(true).
-				Render(rightpad("  "+selectLabel, leftW))
+			// No tag-with-bg embedded here, so the single Render is safe —
+			// but still build it as one segment + explicit padding so the
+			// pattern matches the entry-row highlight (and works the same
+			// if we ever add tag-like elements here later).
+			selBg := lipgloss.NewStyle().
+				Background(theme.AccentHi).
+				Foreground(lipgloss.Color("#000000")).
+				Bold(true)
+			content := selBg.Render("  " + selectLabel)
+			if w := lipgloss.Width(content); w < leftW {
+				content += selBg.Render(strings.Repeat(" ", leftW-w))
+			}
+			return content
 		}
 		return lipgloss.NewStyle().Bold(true).Foreground(theme.Green).Render(raw)
 	}
@@ -1014,6 +1257,10 @@ func (f *fileBrowser) view(w, h int) string {
 			isSel := i == f.idx
 			icon := iconFor(e)
 			discouraged := sharingDiscouraged(f.cwd, e.Name, e.IsDir)
+			// Detect "already shared as Taildrive" — full absolute path
+			// match against the sharedPaths set built at constructor time.
+			fullPath := joinPath(f.device, f.cwd, e.Name)
+			alreadyShared := e.IsDir && f.sharedPaths[strings.TrimRight(fullPath, "/")]
 
 			nm := e.Name
 			if e.IsDir {
@@ -1040,27 +1287,42 @@ func (f *fileBrowser) view(w, h int) string {
 				nm = string(runes) + "…"
 			}
 
-			// Tag: rendered with category color, but DIMMED when this row
-			// is in the "discouraged sharing" set so the operator sees the
-			// guardrail without it shouting.
+			// Tag column priority: SHARED > discouraged > normal type tag.
+			// SHARED takes the slot because it's the most operationally
+			// load-bearing signal: the operator is HERE to pick a folder
+			// to share, and we want them to spot at-a-glance that this
+			// dir is already published.
 			var tagStr string
-			if discouraged {
+			switch {
+			case alreadyShared:
+				tagStr = lipgloss.NewStyle().
+					Background(lipgloss.Color("#0891b2")). // cyan-600 — matches device-badge color (Taildrive identity)
+					Foreground(lipgloss.Color("#ffffff")).
+					Bold(true).
+					Padding(0, 1).Render("SHARED")
+			case discouraged:
 				tagLabel, _ := tagInfo(e)
 				tagStr = lipgloss.NewStyle().
 					Foreground(lipgloss.Color("#525252")).
 					Background(lipgloss.Color("#1a1a1a")).
 					Padding(0, 1).Render(tagLabel)
-			} else {
+			default:
 				tagStr = renderTag(e)
 			}
 			tagW := lipgloss.Width(tagStr)
 			tagLeftPad := max0(maxTagWidth - tagW)
 
-			// Build the row. Selected row uses a single background sweep so
-			// the highlight covers the FULL pane width (leftW, not
-			// leftW-4) — otherwise the rightmost 4 cells fall through to
-			// the terminal background, producing the "dark blue bleeding
-			// through on the right side" the operator flagged.
+			// Build the row. Selected-row highlight has a subtle lipgloss
+			// gotcha: wrapping the whole composed string in one Background
+			// style breaks at the tag's boundary because tagStr ends with
+			// \x1b[0m (lipgloss reset), which wipes the outer bg for
+			// everything that follows. Result was the trailing pad cells
+			// falling through to terminal bg — the "dark blue bleed on the
+			// right side of the tag" the operator flagged.
+			//
+			// Fix: render each segment with the highlight style independently
+			// so each segment's bg attribute survives the prior reset, and
+			// preserve tagStr's own bg by leaving it un-restyled.
 			if isSel {
 				nmWithMarker := nm
 				if e.IsSymlink {
@@ -1068,12 +1330,19 @@ func (f *fileBrowser) view(w, h int) string {
 				}
 				namePadded := nmWithMarker + strings.Repeat(" ",
 					max0(nameColW-lipgloss.Width(nmWithMarker)))
-				raw := "  " + icon + " " + namePadded + " " +
-					strings.Repeat(" ", tagLeftPad) + tagStr
-				leftLines = append(leftLines,
-					lipgloss.NewStyle().
-						Background(theme.AccentHi).Foreground(lipgloss.Color("#000000")).
-						Render(rightpad(raw, leftW)))
+				selBg := lipgloss.NewStyle().
+					Background(theme.AccentHi).
+					Foreground(lipgloss.Color("#000000"))
+				// Everything BEFORE the tag in one styled span.
+				preTag := selBg.Render("  " + icon + " " + namePadded + " " +
+					strings.Repeat(" ", tagLeftPad))
+				row := preTag + tagStr
+				// Trailing pad: re-apply the highlight style explicitly so
+				// it's a fresh span, immune to the tag's terminating reset.
+				if w := lipgloss.Width(row); w < leftW {
+					row += selBg.Render(strings.Repeat(" ", leftW-w))
+				}
+				leftLines = append(leftLines, row)
 				continue
 			}
 
@@ -1218,6 +1487,56 @@ func (f *fileBrowser) view(w, h int) string {
 				"  "+lipgloss.NewStyle().Foreground(lipgloss.Color("#22d3ee")).
 					Render(e.LinkTarget))
 		}
+		// Recursive directory stats block — only for dirs, only when the
+		// async walk has finished AND produced numbers. Computing state
+		// shows a "scanning…" line so the operator knows something's
+		// happening rather than thinking we just have nothing to show.
+		if e.IsDir {
+			full := joinPath(f.device, f.cwd, e.Name)
+			if stats, ok := f.dirStats[full]; ok {
+				rightLines = append(rightLines, "",
+					theme.TitleActive.Render("  ─── recursive contents ───"))
+				if stats.Computing {
+					rightLines = append(rightLines,
+						"  "+theme.ItemDim.Render("scanning…"))
+				} else {
+					rightLines = append(rightLines,
+						"  "+dotLeader("Size (recursive)",
+							theme.Item.Render(humanSize(stats.Size)), detailRowW))
+					if stats.SubdirCount > 0 {
+						rightLines = append(rightLines,
+							"  "+dotLeader("CHILDREN DIRECTORIES",
+								theme.Item.Render(fmt.Sprintf("%d", stats.SubdirCount)),
+								detailRowW))
+					}
+					// Sort categories by count desc for at-a-glance scanning.
+					type kv struct {
+						K string
+						V int
+					}
+					var sorted []kv
+					for k, v := range stats.ByCategory {
+						sorted = append(sorted, kv{k, v})
+					}
+					sort.Slice(sorted, func(i, j int) bool {
+						if sorted[i].V != sorted[j].V {
+							return sorted[i].V > sorted[j].V
+						}
+						return sorted[i].K < sorted[j].K
+					})
+					for _, kvp := range sorted {
+						rightLines = append(rightLines,
+							"  "+dotLeader(kvp.K,
+								theme.Item.Render(fmt.Sprintf("%d", kvp.V)),
+								detailRowW))
+					}
+					if stats.Truncated {
+						rightLines = append(rightLines,
+							"  "+theme.Warn.Render("(scan capped at 50K entries / 3s — numbers are partial)"))
+					}
+				}
+			}
+		}
 	}
 	for len(rightLines) < bodyH {
 		rightLines = append(rightLines, "")
@@ -1314,6 +1633,15 @@ func (f *fileBrowser) updateSearch(m tea.KeyMsg) (*fileBrowser, tea.Cmd) {
 			f.searchIdx = len(f.searchResults) - 1
 		}
 		return f, nil
+	case "ctrl+d":
+		// Toggle directories-only mode. Re-runs the fuzzy match against
+		// the filtered pool immediately so the result list updates without
+		// requiring another keystroke.
+		f.searchDirsOnly = !f.searchDirsOnly
+		f.applySearch()
+		f.searchIdx = 0
+		f.searchScroll = 0
+		return f, nil
 	}
 	// Any other key -> feed to the text input, then refilter.
 	var cmd tea.Cmd
@@ -1331,6 +1659,15 @@ func (f *fileBrowser) renderSearchView(w, h int) string {
 
 	header := f.renderDeviceBadge()
 	statusLine := ""
+	dirsOnlyTag := ""
+	if f.searchDirsOnly {
+		dirsOnlyTag = "  " + lipgloss.NewStyle().
+			Background(lipgloss.Color("#0891b2")).
+			Foreground(lipgloss.Color("#ffffff")).
+			Bold(true).
+			Padding(0, 1).
+			Render("DIRS ONLY")
+	}
 	switch {
 	case f.searchScanning:
 		statusLine = theme.ItemDim.Render("  indexing filesystem… (")
@@ -1343,6 +1680,7 @@ func (f *fileBrowser) renderSearchView(w, h int) string {
 			"  %d entries indexed under %s · %d matches",
 			len(f.searchIndex), f.searchRoot(), len(f.searchResults)))
 	}
+	statusLine += dirsOnlyTag
 
 	inputBox := lipgloss.NewStyle().
 		Background(lipgloss.Color("#1a1a1a")).
@@ -1408,8 +1746,13 @@ func (f *fileBrowser) renderSearchView(w, h int) string {
 				Render(strings.Repeat(" ", w-2)))
 	}
 
+	dirsHint := "Ctrl+D dirs-only"
+	if f.searchDirsOnly {
+		dirsHint = "Ctrl+D show files too"
+	}
 	hint := theme.ItemDim.Render(
-		"  type to fuzzy-match · ↑↓ navigate · Enter drill into · Esc close search")
+		"  type to fuzzy-match · ↑↓ navigate · Enter drill in · " +
+			dirsHint + " · Esc close search")
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		"  "+header,

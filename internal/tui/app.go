@@ -21,6 +21,8 @@ import (
 	"github.com/archn3m3sis/taildrives/internal/cfg"
 	"github.com/archn3m3sis/taildrives/internal/desc"
 	"github.com/archn3m3sis/taildrives/internal/envcfg"
+	"github.com/sahilm/fuzzy"
+
 	"github.com/archn3m3sis/taildrives/internal/imgview"
 	"github.com/archn3m3sis/taildrives/internal/kittyimg"
 	"github.com/archn3m3sis/taildrives/internal/local"
@@ -147,8 +149,11 @@ type Model struct {
 	// help overlay
 	helpOpen bool
 
-	// search/filter input (in files pane)
-	search string
+	// search/filter input (in files pane). searchDirsOnly toggles via
+	// Ctrl+D in search mode — when true, the fuzzy filter drops file
+	// entries from the result list and keeps only directories.
+	search         string
+	searchDirsOnly bool
 
 	// copy "clipboard": when set, c captured a source. Next c drops it at
 	// the current path; Esc cancels.
@@ -612,12 +617,45 @@ func (m Model) updatePrompt(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc":
+			// For search prompts, also clear the active filter so Esc
+			// produces "back to the unfiltered list" — what the operator
+			// expects when they're done searching. Reset the dirs-only
+			// toggle too so the next search session starts fresh.
+			if m.promptKind == "search" {
+				m.search = ""
+				m.searchDirsOnly = false
+				m.dirIdx = 0
+			}
 			m.promptActive = false
 			m.prompt.Blur()
 			return m, nil
+		case "ctrl+d":
+			// Toggle dirs-only filter live inside the search prompt.
+			// dirIdx snaps to 0 so the highlighted row stays valid after
+			// the result set shrinks.
+			if m.promptKind == "search" {
+				m.searchDirsOnly = !m.searchDirsOnly
+				m.dirIdx = 0
+				mode := "files+dirs"
+				if m.searchDirsOnly {
+					mode = "dirs only"
+				}
+				m.setStatus("info", "Search filter: "+mode)
+				return m, nil
+			}
 		case "enter":
 			val := strings.TrimSpace(m.prompt.Value())
 			kind := m.promptKind
+			// Search mode commits the current filter and closes the input
+			// while KEEPING the filter active. Operator can scroll the
+			// narrowed list, drill in, then Esc later to clear.
+			if kind == "search" {
+				m.search = val
+				m.promptActive = false
+				m.prompt.Blur()
+				m.dirIdx = 0
+				return m, nil
+			}
 			m.promptActive = false
 			m.prompt.Blur()
 			m.prompt.SetValue("")
@@ -626,6 +664,13 @@ func (m Model) updatePrompt(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	var cmd tea.Cmd
 	m.prompt, cmd = m.prompt.Update(msg)
+	// LIVE filter: while typing in the search prompt, mirror the input
+	// into m.search so visibleFiles updates per keystroke (no need to
+	// press Enter to see results). Other prompt kinds remain modal.
+	if m.promptKind == "search" {
+		m.search = m.prompt.Value()
+		m.dirIdx = 0
+	}
 	return m, cmd
 }
 
@@ -850,6 +895,18 @@ func (m Model) handleKeyFiles(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := m.keys
 	visible := m.visibleFiles()
 	switch {
+	case key.Matches(msg, k.Search):
+		// Open the search prompt — live-filter on every keystroke (the
+		// promptKind="search" branch in updatePrompt re-writes m.search
+		// per character rather than waiting on Enter). `s` and `/` both
+		// trigger; matches the wizard file browser's `s` shortcut.
+		m.promptKind = "search"
+		m.prompt.SetValue(m.search)
+		m.prompt.Placeholder = "fuzzy-match share / file names…"
+		m.prompt.Focus()
+		m.promptActive = true
+		m.setStatus("info", "Search — type to filter live, Esc clears + closes")
+		return m, textinput.Blink
 	case key.Matches(msg, k.Up):
 		if m.dirIdx > 0 {
 			m.dirIdx--
@@ -1572,16 +1629,7 @@ func (m Model) visibleFiles() []webdav.Entry {
 	// (intentional user input narrows the visible set).
 	if m.active == paneCats && len(m.dirStack) == 0 {
 		visible := m.aggregatedShares()
-		if m.search != "" {
-			s := strings.ToLower(m.search)
-			out := visible[:0]
-			for _, e := range visible {
-				if strings.Contains(strings.ToLower(e.Name), s) {
-					out = append(out, e)
-				}
-			}
-			visible = out
-		}
+		visible = fuzzyFilterEntries(visible, m.search, m.searchDirsOnly)
 		return visible
 	}
 
@@ -1589,17 +1637,39 @@ func (m Model) visibleFiles() []webdav.Entry {
 	// Per-device root: previously filtered here too — now leave the full
 	// list and let the renderer dim non-matching entries. Search still
 	// narrows since it's explicit user input.
-	if m.search != "" {
-		var out []webdav.Entry
-		s := strings.ToLower(m.search)
-		for _, e := range visible {
-			if strings.Contains(strings.ToLower(e.Name), s) {
-				out = append(out, e)
+	visible = fuzzyFilterEntries(visible, m.search, m.searchDirsOnly)
+	return visible
+}
+
+// fuzzyFilterEntries narrows a webdav.Entry slice via fuzzy match (same
+// sahilm/fuzzy lib the wizard file browser uses for its `s` overlay).
+// Empty query returns the input unchanged (subject to dirsOnly). When
+// dirsOnly is set, non-directory entries are dropped from the candidate
+// pool BEFORE the fuzzy match runs, so dir matches don't get drowned out.
+// Match-rank order from the fuzzy lib is preserved — best matches first.
+func fuzzyFilterEntries(entries []webdav.Entry, q string, dirsOnly bool) []webdav.Entry {
+	pool := entries
+	if dirsOnly {
+		pool = pool[:0:0]
+		for _, e := range entries {
+			if e.IsDir {
+				pool = append(pool, e)
 			}
 		}
-		visible = out
 	}
-	return visible
+	if q == "" {
+		return pool
+	}
+	names := make([]string, len(pool))
+	for i, e := range pool {
+		names[i] = e.Name
+	}
+	matches := fuzzy.Find(q, names)
+	out := make([]webdav.Entry, 0, len(matches))
+	for _, m := range matches {
+		out = append(out, pool[m.Index])
+	}
+	return out
 }
 
 // isInActiveCategory reports whether the entry passes the currently

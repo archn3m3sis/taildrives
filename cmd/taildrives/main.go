@@ -20,9 +20,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/archn3m3sis/taildrives/internal/actions"
+	"github.com/archn3m3sis/taildrives/internal/advanced"
 	"github.com/archn3m3sis/taildrives/internal/cats"
 	"github.com/archn3m3sis/taildrives/internal/cfg"
 	"github.com/archn3m3sis/taildrives/internal/local"
+	"github.com/archn3m3sis/taildrives/internal/netmap"
 	"github.com/archn3m3sis/taildrives/internal/outro"
 	"github.com/archn3m3sis/taildrives/internal/splash"
 	"github.com/archn3m3sis/taildrives/internal/theme"
@@ -186,6 +188,24 @@ func runTUI() error {
 				return wizards.NewAddShareWizard(actor)
 			case splash.ActionRemoveShares:
 				return wizards.NewRemoveShareWizard(actor)
+			case splash.ActionHelp:
+				return wizards.NewHelpOverlay()
+			// Advanced Options tab: TAILNET ENV MAPPING is the centerpiece
+			// (real implementation in internal/netmap); the other five
+			// land as scoped-preview overlays in internal/advanced until
+			// their implementations ship across v0.14.x.
+			case splash.ActionTailnetEnvMapping:
+				return netmap.New()
+			case splash.ActionDataTransmissionMapping:
+				return advanced.NewDataTransmissionMapping()
+			case splash.ActionDERPServerStatus:
+				return advanced.NewDERPServerStatus()
+			case splash.ActionConnectionTypeSummary:
+				return advanced.NewConnectionTypeSummary()
+			case splash.ActionTSCLIScheduler:
+				return advanced.NewTSCLIScheduler()
+			case splash.ActionTSCLIWatcher:
+				return advanced.NewTSCLIWatcher()
 			}
 			return nil
 		})
@@ -211,9 +231,11 @@ func runTUI() error {
 			return openBrowser(issuesURL)
 		case splash.ActionFeatureRequest:
 			return openBrowser(featureURL)
-		case splash.ActionHelp:
-			fmt.Print(usage)
-			return nil
+		// ActionHelp is handled by the splash overlay factory now —
+		// helpOverlay stays inside the TUI, Esc returns to the menu.
+		// Reaching here would mean the factory returned nil (defensive
+		// fallback only) — silently drop instead of dumping `usage` to
+		// stdout, which previously felt like a crash.
 		case splash.ActionEnter, splash.ActionNone:
 			return runMainTUI()
 		}

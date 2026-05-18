@@ -50,6 +50,15 @@ const (
 	ActionDeviceStatusReport
 	ActionPerformanceReport
 	ActionLifecycleJournal
+
+	// Advanced Actions — diagnostic / observability features, also handled
+	// IN-PROCESS via overlays. Live on the third splash tab.
+	ActionTailnetEnvMapping
+	ActionDataTransmissionMapping
+	ActionDERPServerStatus
+	ActionConnectionTypeSummary
+	ActionTSCLIScheduler
+	ActionTSCLIWatcher
 )
 
 // Overlay re-exports the shared overlay.Overlay so splash callers can
@@ -126,6 +135,15 @@ var globalActions = []menuItem{
 	{5, "TAILDRIVES LIFECYCLE JOURNAL", ActionLifecycleJournal},
 }
 
+var advancedActions = []menuItem{
+	{1, "TAILNET ENV MAPPING", ActionTailnetEnvMapping},
+	{2, "DATA TRANSMISSION MAPPING", ActionDataTransmissionMapping},
+	{3, "DERP SERVER STATUS", ActionDERPServerStatus},
+	{4, "CONNECTION TYPE SUMMARY", ActionConnectionTypeSummary},
+	{5, "TS-CLI SCHEDULER", ActionTSCLIScheduler},
+	{6, "TS-CLI WATCHER", ActionTSCLIWatcher},
+}
+
 // ── Model ──────────────────────────────────────────────────────────────────
 
 type Model struct {
@@ -136,7 +154,11 @@ type Model struct {
 	typed     string
 	menuIdx   int
 	globalIdx int
-	onGlobal  bool
+	advIdx    int
+	// tab is 0 = main menu, 1 = global actions, 2 = advanced options.
+	// Tab cycles forward, Shift+Tab cycles back. Replaces the old onGlobal
+	// boolean which only handled two tabs.
+	tab       int
 	keys      keymap
 	skipped   bool
 	finalQuit bool
@@ -243,16 +265,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.skipped = true
 			return m, nil
 		}
-		// Menu navigation
-		active := menu
-		idx := &m.menuIdx
-		if m.onGlobal {
-			active = globalActions
-			idx = &m.globalIdx
-		}
+		// Menu navigation — three tabs: 0=main, 1=globals, 2=advanced.
+		// activeTab returns the slice + idx pointer for the current tab so
+		// the switch below operates on one set of variables regardless of
+		// which tab is open.
+		active, idx := m.activeTab()
 		switch {
 		case key.Matches(msg, m.keys.Tab):
-			m.onGlobal = !m.onGlobal
+			m.tab = (m.tab + 1) % 3
 		case key.Matches(msg, m.keys.Up):
 			if *idx > 0 {
 				*idx--
@@ -287,7 +307,10 @@ func (m Model) selectAction(a Action) (tea.Model, tea.Cmd) {
 		switch a {
 		case ActionRemoveShares, ActionAddShares,
 			ActionDeviceStatusReport, ActionPerformanceReport,
-			ActionLifecycleJournal:
+			ActionLifecycleJournal, ActionHelp,
+			ActionTailnetEnvMapping, ActionDataTransmissionMapping,
+			ActionDERPServerStatus, ActionConnectionTypeSummary,
+			ActionTSCLIScheduler, ActionTSCLIWatcher:
 			m.overlay = m.factory(a)
 			if m.overlay != nil {
 				return m, m.overlay.Init()
@@ -403,21 +426,65 @@ func (m Model) View() string {
 	return canvas
 }
 
-func (m Model) renderMenu() string {
-	active := menu
-	idx := m.menuIdx
-	accent := theme.AccentHi
-	border := theme.PurpleDeep
-	tabLabel := "Tab → Global Actions"
-	heading := "MAIN MENU"
-	if m.onGlobal {
-		active = globalActions
-		idx = m.globalIdx
-		accent = theme.Yellow
-		border = theme.Yellow
-		tabLabel = "Tab → Main Menu"
-		heading = "GLOBAL ACTIONS"
+// activeTab returns the menu slice + a pointer to the index for the
+// currently-focused tab. Centralizes the three-tab dispatch so the rest
+// of the splash code (Update + renderMenu) doesn't need parallel
+// switches.
+func (m *Model) activeTab() ([]menuItem, *int) {
+	switch m.tab {
+	case 1:
+		return globalActions, &m.globalIdx
+	case 2:
+		return advancedActions, &m.advIdx
+	default:
+		return menu, &m.menuIdx
 	}
+}
+
+func (m Model) renderMenu() string {
+	// Per-tab visual config: accent color, border, heading text.
+	type tabSpec struct {
+		label    string
+		accent   lipgloss.Color
+		border   lipgloss.Color
+		heading  string
+	}
+	tabs := []tabSpec{
+		{"MAIN MENU", theme.AccentHi, theme.PurpleDeep, "MAIN MENU"},
+		{"GLOBAL ACTIONS", theme.Yellow, theme.Yellow, "GLOBAL ACTIONS"},
+		{"ADVANCED OPTIONS", theme.Magenta, theme.Magenta, "ADVANCED OPTIONS"},
+	}
+	cur := tabs[m.tab]
+	var active []menuItem
+	var idx int
+	switch m.tab {
+	case 1:
+		active, idx = globalActions, m.globalIdx
+	case 2:
+		active, idx = advancedActions, m.advIdx
+	default:
+		active, idx = menu, m.menuIdx
+	}
+
+	// Tab strip at the top — three pills, the active one bright/reversed,
+	// inactive ones muted. Tells the operator at-a-glance which tab they
+	// are on and what's available.
+	pill := func(label string, isActive bool) string {
+		st := lipgloss.NewStyle().Padding(0, 2)
+		if isActive {
+			return st.
+				Background(cur.accent).Foreground(lipgloss.Color("#000000")).
+				Bold(true).Render(label)
+		}
+		return st.
+			Foreground(lipgloss.Color("#525252")).
+			Render(label)
+	}
+	tabStrip := pill(tabs[0].label, m.tab == 0) +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#262626")).Render(" │ ") +
+		pill(tabs[1].label, m.tab == 1) +
+		lipgloss.NewStyle().Foreground(lipgloss.Color("#262626")).Render(" │ ") +
+		pill(tabs[2].label, m.tab == 2)
 
 	var lines []string
 	for i, it := range active {
@@ -425,9 +492,9 @@ func (m Model) renderMenu() string {
 		labelStyle := lipgloss.NewStyle().Foreground(theme.Text)
 		numStyle := lipgloss.NewStyle().Foreground(theme.TextMuted)
 		if i == idx {
-			cursor = lipgloss.NewStyle().Foreground(accent).Bold(true).Render(" ▸ ")
-			labelStyle = lipgloss.NewStyle().Foreground(accent).Bold(true).Underline(true)
-			numStyle = lipgloss.NewStyle().Foreground(accent).Bold(true)
+			cursor = lipgloss.NewStyle().Foreground(cur.accent).Bold(true).Render(" ▸ ")
+			labelStyle = lipgloss.NewStyle().Foreground(cur.accent).Bold(true).Underline(true)
+			numStyle = lipgloss.NewStyle().Foreground(cur.accent).Bold(true)
 		}
 		line := fmt.Sprintf("%s%s  %s",
 			cursor,
@@ -436,19 +503,17 @@ func (m Model) renderMenu() string {
 		lines = append(lines, line)
 	}
 	headingLine := lipgloss.NewStyle().
-		Foreground(accent).Bold(true).Reverse(true).
-		Render("  " + heading + "  ")
-	tabHint := lipgloss.NewStyle().
-		Foreground(accent).Italic(true).
-		Render(tabLabel)
+		Foreground(cur.accent).Bold(true).Reverse(true).
+		Render("  " + cur.heading + "  ")
 	hint := lipgloss.NewStyle().
 		Foreground(theme.TextMuted).Italic(true).
-		Render("↑/↓ navigate · 1-5 jump · Enter select · Tab switch menu · q quit")
+		Render("↑/↓ navigate · 1-6 jump · Enter select · Tab cycle tabs · q quit")
 	box := lipgloss.NewStyle().
 		Border(lipgloss.DoubleBorder()).
-		BorderForeground(border).
+		BorderForeground(cur.border).
 		Padding(1, 4).
-		Render(headingLine + "   " + tabHint + "\n\n" +
+		Render(tabStrip + "\n\n" +
+			headingLine + "\n\n" +
 			strings.Join(lines, "\n") + "\n\n" + hint)
 	return box
 }
