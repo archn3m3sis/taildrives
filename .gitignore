@@ -1,0 +1,15 @@
+# Cross-compiled release binaries — built reproducibly via `go build`, never tracked.
+bin/
+dist/
+
+# Go test artifacts
+*.test
+*.out
+coverage.txt
+
+# Editor / OS junk
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
